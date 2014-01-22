@@ -1,28 +1,32 @@
 module ActiveRecord
-  # Updated using https://github.com/rails/rails/blob/0342335473ec1b9977e26089c28d7135ce98d254/activerecord/lib/active_record/enum.rb
-  # Declare an enum attribute where the values map to integers in the database, but can be queried by name. Example:
+  # Declare an enum attribute where the values map to integers in the database,
+  # but can be queried by name. Example:
   #
   #   class Conversation < ActiveRecord::Base
-  #     enum status: [:active, :archived]
-  #
-  #     # same but with explicit mapping
-  #     enum status: {active: 0, archived: 1}
+  #     enum status: [ :active, :archived ]
   #   end
-  #
-  #   Conversation::STATUS # => { active: 0, archived: 1 }
   #
   #   # conversation.update! status: 0
   #   conversation.active!
   #   conversation.active? # => true
-  #   conversation.status  # => :active
+  #   conversation.status  # => "active"
   #
   #   # conversation.update! status: 1
   #   conversation.archived!
   #   conversation.archived? # => true
-  #   conversation.status    # => :archived
+  #   conversation.status    # => "archived"
   #
   #   # conversation.update! status: 1
-  #   conversation.status = :archived
+  #   conversation.status = "archived"
+  #
+  #   # conversation.update! status: nil
+  #   conversation.status = nil
+  #   conversation.status.nil? # => true
+  #   conversation.status      # => nil
+  #
+  # Scopes based on the allowed values of the enum field will be provided
+  # as well. With the above example, it will create an +active+ and +archived+
+  # scope.
   #
   # You can set the default value from the database declaration, like:
   #
@@ -31,35 +35,118 @@ module ActiveRecord
   #   end
   #
   # Good practice is to let the first declared status be the default.
+  #
+  # Finally, it's also possible to explicitly map the relation between attribute and
+  # database integer with a +Hash+:
+  #
+  #   class Conversation < ActiveRecord::Base
+  #     enum status: { active: 0, archived: 1 }
+  #   end
+  #
+  # Note that when an +Array+ is used, the implicit mapping from the values to database
+  # integers is derived from the order the values appear in the array. In the example,
+  # <tt>:active</tt> is mapped to +0+ as it's the first element, and <tt>:archived</tt>
+  # is mapped to +1+. In general, the +i+-th element is mapped to <tt>i-1</tt> in the
+  # database.
+  #
+  # Therefore, once a value is added to the enum array, its position in the array must
+  # be maintained, and new values should only be added to the end of the array. To
+  # remove unused values, the explicit +Hash+ syntax should be used.
+  #
+  # In rare circumstances you might need to access the mapping directly.
+  # The mappings are exposed through a class method with the pluralized attribute
+  # name:
+  #
+  #   Conversation.statuses # => { "active" => 0, "archived" => 1 }
+  #
+  # Use that class method when you need to know the ordinal value of an enum:
+  #
+  #   Conversation.where("status <> ?", Conversation.statuses[:archived])
   module Enum
+    DEFINED_ENUMS = {} # :nodoc:
+
+    def enum_mapping_for(attr_name) # :nodoc:
+      DEFINED_ENUMS[attr_name.to_s]
+    end
+
     def enum(definitions)
+      klass = self
       definitions.each do |name, values|
-        const_name = name.to_s.upcase
+        # statuses = { }
+        enum_values = ActiveSupport::HashWithIndifferentAccess.new
+        name        = name.to_sym
 
-        # DIRECTION = { }
-        const_set const_name, {}
+        # def self.statuses statuses end
+        klass.singleton_class.send(:define_method, name.to_s.pluralize) { enum_values }
 
-        # def direction=(value) self[:direction] = DIRECTION[value] end
-        class_eval "def #{name}=(value) self[:#{name}] = #{const_name}[value] end"
+        _enum_methods_module.module_eval do
+          # def status=(value) self[:status] = statuses[value] end
+          define_method("#{name}=") { |value|
+            if enum_values.has_key?(value) || value.blank?
+              self[name] = enum_values[value]
+            elsif enum_values.has_value?(value)
+              # Assigning a value directly is not a end-user feature, hence it's not documented.
+              # This is used internally to make building objects from the generated scopes work
+              # as expected, i.e. +Conversation.archived.build.archived?+ should be true.
+              self[name] = value
+            else
+              raise ArgumentError, "'#{value}' is not a valid #{name}"
+            end
+          }
 
-        # def direction() DIRECTION.key self[:direction] end
-        class_eval "def #{name}() #{const_name}.key self[:#{name}] end"
+          # def status() statuses.key self[:status] end
+          define_method(name) { enum_values.key self[name] }
 
-        pairs = values.respond_to?(:each_pair) ? values.each_pair : values.each_with_index
-        pairs.each do |value, i|
-          # DIRECTION[:incoming] = 0
-          const_get(const_name)[value] = i
+          # def status_before_type_cast() statuses.key self[:status] end
+          define_method("#{name}_before_type_cast") { enum_values.key self[name] }
 
-          # scope :incoming, -> { where direction: 0 }
-          scope value, -> { where name => i }
+          pairs = values.respond_to?(:each_pair) ? values.each_pair : values.each_with_index
+          pairs.each do |value, i|
+            enum_values[value] = i
 
-          # def incoming?() direction == 0 end
-          class_eval "def #{value}?() self[:#{name}] == #{i} end"
+            # scope :active, -> { where status: 0 }
+            klass.scope value, -> { klass.where name => i }
 
-          # def incoming! update! direction: :incoming end
-          class_eval "def #{value}!() update! #{name}: :#{value} end"
+            # def active?() status == 0 end
+            define_method("#{value}?") { self[name] == i }
+
+            # def active!() update! status: :active end
+            define_method("#{value}!") { update! name => value }
+          end
+
+          DEFINED_ENUMS[name.to_s] = enum_values
         end
       end
     end
+
+    private
+      def _enum_methods_module
+        @_enum_methods_module ||= begin
+          mod = Module.new do
+            private
+              def save_changed_attribute(attr_name, value)
+                if (mapping = self.class.enum_mapping_for(attr_name))
+                  if attribute_changed?(attr_name)
+                    old = changed_attributes[attr_name]
+
+                    if mapping[old] == value
+                      changed_attributes.delete(attr_name)
+                    end
+                  else
+                    old = clone_attribute_value(:read_attribute, attr_name)
+
+                    if old != value
+                      changed_attributes[attr_name] = mapping.key old
+                    end
+                  end
+                else
+                  super
+                end
+              end
+          end
+          include mod
+          mod
+        end
+      end
   end
 end
